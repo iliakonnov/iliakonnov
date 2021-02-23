@@ -1,0 +1,297 @@
+#!/bin/bash
+
+# Exit immediately if any commands return non-zero
+set -e
+
+# Config variables.
+url="https://freetsa.org/tsr"
+cafile="freetsa-cacert.pem"
+request_delay=15 # COMODO asks for this in scripts.
+blobref="tsa-blobs" # tsa = time stamp authority
+
+# Make sure the script was called from within a Git repo.  Ignore
+# stdout.
+git rev-parse --show-toplevel > /dev/null
+
+# Start with flags set to false
+delay_next=false
+verbose=false
+ltime=false
+
+prep() {
+    # Assume we start with no note.
+    note=false
+
+    # The revision should be the first argument.
+    rev="$1"
+
+    # If no revision is specified, assume HEAD.
+    if [ -z "$rev" ]; then
+        rev="HEAD"
+    fi
+
+    # Run git rev-parse since it will expand HEAD and shortend hashes for
+    # us.
+    rev="$(git rev-parse "$rev")"
+
+    # Figure out if the timestamp note exists.
+    git notes --ref="$blobref" show "$rev" > /dev/null 2>&1 && note=true \
+        || true # Make sure the command exits 0
+}
+
+print_rev() {
+    if $verbose; then
+        echo "$rev"
+    else
+        echo "$(git rev-parse --short "$rev")"
+    fi
+}
+
+print_signed_timestamp() {
+    tsatime="$(echo "$1" | grep -i "time stamp:" | cut -c13-)"
+    echo -e "\t$(date -d "$tsatime" +"SIGNED-%d-%b-%Y")"
+    #echo "$(date -d "$tsatime" --iso-8601=minutes)"
+    #echo "$(date -d "$tsatime" +"%Y-%m-%d-%T-%Z")"
+}
+
+print_local_timestamp() {
+    if $ltime; then
+        ctime="$(git log --pretty=format:"%ad" --date=iso "$rev" -1)"
+        echo -e "\t$(date -d "$ctime" +"COMMITTED-%d-%b-%Y")"
+    fi
+}
+
+# This outputs the text version of the TSA reply for the current
+# revision.
+examine() {
+    if $note; then
+        timestamp="$(git notes --ref="$blobref" show "$rev")"
+        text="$(echo "$timestamp" | openssl enc -d -base64 | openssl ts -reply -in /dev/stdin -text)"
+
+        echo "--------------------------------------------------------------------------------"
+        echo "Revision: ${rev}$(print_local_timestamp)"
+        echo "--------------------------------------------------------------------------------"
+        echo "$text"
+        echo "--------------------------------------------------------------------------------"
+    else
+        echo "$(print_rev)$(print_local_timestamp)\tNo trusted timestamp."
+    fi
+}
+
+# This loads the TSA reply for the current revision from git notes,
+# re-verifies it, and outputs short info about the verified timestamp.
+verify() {
+    if ! $note; then
+        echo -e "$(print_rev)$(print_local_timestamp)\tNo trusted timestamp."
+        return 0
+    fi
+
+    timestamp="$(git notes --ref="$blobref" show "$rev")"
+    text="$(echo "$timestamp" | openssl enc -d -base64 | openssl ts -reply -in /dev/stdin -text)"
+    echo "$timestamp" | openssl enc -d -base64 \
+        | openssl ts -verify -digest "$rev" -in /dev/stdin -CAfile "$cafile"  > /dev/null 2>&1
+
+    echo -e "$(print_rev)$(print_local_timestamp)$(print_signed_timestamp "$text")"
+}
+
+# This creates a note for the current revision and verifies it.  If the
+# verification is successful, the reply is base64 encoded and stored
+# in the $ref namespace of git notes for the current revision.  After
+# storing the note, it is re-loaded, un-coded, and re-verified before
+# outputting short info about the verified timestamp.
+create() {
+    if $note; then
+        verify
+        return 0
+    fi
+
+    # Wait for the delay requested by the timestamp service.
+    if $delay_next; then
+        sleep $request_delay
+    fi
+
+    # Content-type and Accept type need to be included in the request header
+    # when connecting to the timestamp service.
+    CONTENT_TYPE="Content-Type: application/timestamp-query"
+    ACCEPT_TYPE="Accept: application/timestamp-reply"
+
+    # Create the timestamp request using the specified revision as a digest.  The
+    # sha1 hashes Git uses for revisions are already in the correct format.  The
+    # default should be sha1, but we specify it anyway to show our intent is to
+    # pass an sha1 hash.
+    #
+    # The request is submitted to the timestamp server using curl.
+    #
+    # The data is base64 encoded and temporarily stored in the TSREPLY variable so
+    # the timestamp can be verified before storing it in Git notes.
+    timestamp=$(openssl ts -query -cert -digest "$rev" -sha1 \
+        | curl -s -H "$CONTENT_TYPE" -H "$ACCEPT_TYPE" --data-binary @- "$url" \
+        | openssl enc -base64)
+
+    # Verify the reply to make sure the timestamp is valid.  We don't want to add
+    # invalid timestamps to Git notes since an invalid timestamp has no value.
+    echo "$timestamp" \
+        | openssl enc -d -base64 \
+        | openssl ts -verify -digest "$rev" -in /dev/stdin -CAfile "$cafile"  > /dev/null 2>&1
+
+    # Put the base64 encoded blob into the $BLOBblobref namespace.
+    echo "$timestamp" | git notes --ref="$blobref" add "$rev" --file -
+
+    # Perform a sanity check to make sure we can re-verify the
+    # timestamp using the blob we just added to the $blobref
+    # namespace.
+    git notes --ref="$blobref" show "$rev" | openssl enc -d -base64 \
+        | openssl ts -verify -digest "$rev" -in /dev/stdin -CAfile "$cafile"  > /dev/null 2>&1
+
+    # Get the text version of the reply
+    text="$(echo "$timestamp" | openssl enc -d -base64 | openssl ts -reply -in /dev/stdin -text)"
+
+    echo -e "$(print_rev)$(print_local_timestamp)$(print_signed_timestamp "$text") (CREATED)"
+    delay_next=true
+}
+
+# This removes the verified timestamp for the current revision.
+remove() {
+    if ! $note; then
+        echo -e "$(print_rev)$(print_local_timestamp)\tNo trusted timestamp. Skipping."
+        return 0
+    fi
+
+    git notes --ref="$blobref" remove "$rev" > /dev/null 2>&1
+
+    echo -e "$(print_rev)$(print_local_timestamp)\tTrusted timestamp removed."
+}
+
+push() {
+    git push "origin" "refs/notes/${blobref}"
+}
+
+fetch() {
+    git fetch "origin" "refs/notes/${blobref}:refs/notes/${blobref}"
+}
+
+# Script logic starts below here.
+
+# Check for very basic switches, mainly to output detailed information
+# about the timestamp.
+while getopts ":vlh" opt; do
+  case $opt in
+    v)
+      verbose=true
+      ;;
+    l)
+      ltime=true
+      ;;
+    h)
+      echo "Usage: git-timestamp [options] command [revision]" >&2
+      echo
+      echo " options"
+      echo "  -h - Show this usage info.  All other options are ignored."
+      echo "  -v - Output long revision instead of short."
+      echo "  -l - Also show the local commit time of the specified revision."
+      echo
+      echo " command"
+      echo "  create  - Create a timestamp. Revisions with existing timestamps will be"
+      echo "            verified instead."
+      echo "  verify  - Verify an existing timestamp. Revisions without a timestamp will"
+      echo "            be skipped."
+      echo "  examine - Show the full text output of an existing timestamp.  Revisions"
+      echo "            without a timestamp will be skipped."
+      echo "  remove  - Remove an existing timestamp.  Revisions without a timestamp"
+      echo "            will be skipped."
+      echo "  push    - Push the timestamp namespace we're using for git notes to origin."
+      echo "  fetch   - Fetch the timestamp namespace we're using for git notes from origin."
+      echo
+      echo " revision"
+      echo "  A git revision number.  Long and short versions are accepted.  The default"
+      echo "  is HEAD if no revision is specified.  Using '-' as the revision number will"
+      echo "  read a rev-list from stdin and run the given command for every revision in"
+      echo "  the rev-list."
+      echo
+      echo " warnings"
+      echo "  Existing timestamps are NEVER overwritten.  It is necessary to explicitly"
+      echo "  remove a timestamp with the 'remove' command if you want to replace it with"
+      echo "  a newer timestamp.  There is likely nothing to be gained from removing a good"
+      echo "  timestamp, so the 'remove' command should normally be used to delete corrupted"
+      echo "  timestamps."
+      echo
+      echo " advanced examples"
+      echo "  - Create timestamps for the HEAD of every branch in the 'origin' repo."
+      echo "  $ git fetch && git ls-remote --heads origin | cut -f1 | git timestamp create -"
+      echo
+      echo "  - Get a rev-list for the origin/develop branch and verify the timestamp for"
+      echo "    each revision in the list.  This is an easy way of showing every trusted"
+      echo "    timestamp for a branch.  Uses the -l option to list commit timestamps too."
+      echo "  $ git fetch && git rev-list origin/develop | git timestamp -l verify -"
+      exit 0
+      ;;
+    \?)
+      echo "Invalid option: -$OPTARG" >&2
+      ;;
+  esac
+done
+
+# Shift past all options so the command is at $1.
+shift $(( OPTIND - 1 ))
+
+cmd="$1"
+
+if [[ "$cmd" != "create" ]] \
+    && [[ "$cmd" != "examine" ]] \
+    && [[ "$cmd" != "verify" ]] \
+    && [[ "$cmd" != "remove" ]] \
+    && [[ "$cmd" != "push" ]] \
+    && [[ "$cmd" != "fetch" ]]; then
+    echo "Invalid command ${cmd}.  Try -h for usage."
+    exit 1
+fi
+
+run() {
+    case "$cmd" in
+    create)
+        create
+        ;;
+    examine)
+        examine
+        ;;
+    verify)
+        verify
+        ;;
+    remove)
+        remove
+        ;;
+    push)
+        push
+        ;;
+    fetch)
+        fetch
+        ;;
+esac
+}
+
+# Shift past the given command so $1 is the revision.
+shift
+
+# If the revision argument is '-' and stdin is not empty, assume
+# we're reading a rev-list from stdin and run the command for
+# every revision in the list.
+if [[ "$1" == "-" ]]; then
+    if [ ! -z /dev/stdin ]; then
+        cat /dev/stdin | while read nextrev; do
+            prep "$nextrev" && isprep=true || true
+
+            if $isprep; then
+                run || one_failed=true
+            fi
+        done
+    fi
+else
+    prep "$1"
+    run
+fi
+
+if $one_failed; then
+    exit 1
+fi
+
+exit 0
