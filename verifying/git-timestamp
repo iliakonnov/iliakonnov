@@ -47,17 +47,19 @@ print_rev() {
     fi
 }
 
+print_message() {
+    echo "$(git show -s --format=%s "$rev")"
+}
+
 print_signed_timestamp() {
     tsatime="$(echo "$1" | grep -i "time stamp:" | cut -c13-)"
-    echo -e "\t$(date -d "$tsatime" +"SIGNED-%d-%b-%Y")"
-    #echo "$(date -d "$tsatime" --iso-8601=minutes)"
-    #echo "$(date -d "$tsatime" +"%Y-%m-%d-%T-%Z")"
+    echo -e "\t$(date -d "$tsatime" +"%Y-%m-%d-%T-%Z")"
 }
 
 print_local_timestamp() {
     if $ltime; then
         ctime="$(git log --pretty=format:"%ad" --date=iso "$rev" -1)"
-        echo -e "\t$(date -d "$ctime" +"COMMITTED-%d-%b-%Y")"
+        echo -e "\t$(date -d "$ctime" +"COMMITTED-%d-%b-%Y-%T-%Z")"
     fi
 }
 
@@ -74,7 +76,7 @@ examine() {
         echo "$text"
         echo "--------------------------------------------------------------------------------"
     else
-        echo "$(print_rev)$(print_local_timestamp)\tNo trusted timestamp."
+        echo -e "$(print_rev)$(print_local_timestamp)\tNo trusted timestamp."
     fi
 }
 
@@ -82,7 +84,7 @@ examine() {
 # re-verifies it, and outputs short info about the verified timestamp.
 verify() {
     if ! $note; then
-        echo -e "$(print_rev)$(print_local_timestamp)\tNo trusted timestamp."
+        echo -e "$(print_rev)$(print_local_timestamp)\tNo trusted timestamp.\t$(print_message)"
         return 0
     fi
 
@@ -91,7 +93,7 @@ verify() {
     echo "$timestamp" | openssl enc -d -base64 \
         | openssl ts -verify -digest "$rev" -in /dev/stdin -CAfile "$cafile"  > /dev/null 2>&1
 
-    echo -e "$(print_rev)$(print_local_timestamp)$(print_signed_timestamp "$text")"
+    echo -e "$(print_rev)$(print_local_timestamp)$(print_signed_timestamp "$text")\t$(print_message)"
 }
 
 # This creates a note for the current revision and verifies it.  If the
