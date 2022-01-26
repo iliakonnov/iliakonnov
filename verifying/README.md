@@ -19,5 +19,5 @@ You can also verify commits using GPG.
 ```bash
 echo "54c1b120a2a5112a62c72a6b3d2947675372ce534d84ee9028f7be11b3ac276d  gpg.pub" | sha256sum -c
 gpg --import < gpg.pub
-git log --pretty=format:'%h %C(auto,green)G%C(reset) %ad %an'
+git log --pretty=format:'%h %C(auto,green)%G?%C(reset) %ad %an'
 ```
